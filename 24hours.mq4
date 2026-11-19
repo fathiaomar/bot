@@ -5,12 +5,14 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, FathiaOmar"
 #property link      "https://github.com/fathiaomar/bot"
-#property version   "2.00"
+#property version   "2.10"
 #property strict
 
 //--- Input Parameters
 input int      MagicNumber       = 240024;    // Unique EA Magic Number
-input double   FixedLotSize      = 0.05;      // Fixed Lot Size
+input bool     UseDynamicLot     = true;      // Use Risk-Based Dynamic Lot Sizing
+input double   RiskPercent       = 1.0;       // Risk Per Trade (% of Balance)
+input double   FixedLotSize      = 0.05;      // Fallback Fixed Lot Size
 input int      StopLossPips      = 30;        // Stop Loss (pips)
 input int      TakeProfitPips    = 60;        // Take Profit (pips)
 input int      MaxSpreadPips     = 3;         // Max Allowed Spread (pips)
@@ -26,9 +28,9 @@ input double   RSISellMax        = 50.0;      // Maximum RSI for Sell Confirmati
 input double   ProfitTargetUSD   = 100.0;     // Account Floating Profit Alert Target ($)
 
 //--- Internal State
-double   g_pipSize     = 0.0;
-int      g_slippagePts = 0;
-datetime g_lastBarTime = 0;
+double   g_pipSize       = 0.0;
+int      g_slippagePts   = 0;
+datetime g_lastBarTime   = 0;
 bool     g_targetAlerted = false;
 
 //+------------------------------------------------------------------+
@@ -39,6 +41,12 @@ int OnInit()
    if(FastEMAPeriod >= SlowEMAPeriod)
      {
       Print("Error: FastEMAPeriod must be less than SlowEMAPeriod.");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+
+   if(RiskPercent <= 0.0 || RiskPercent > 10.0)
+     {
+      Print("Error: RiskPercent must be between 0.01 and 10.0.");
       return(INIT_PARAMETERS_INCORRECT);
      }
 
@@ -130,12 +138,45 @@ int CountOpenOrders()
   }
 
 //+------------------------------------------------------------------+
+//| Calculate normalized lot size based on account risk percentage   |
+//+------------------------------------------------------------------+
+double CalculateLotSize()
+  {
+   double minLot  = MarketInfo(Symbol(), MODE_MINLOT);
+   double maxLot  = MarketInfo(Symbol(), MODE_MAXLOT);
+   double lotStep = MarketInfo(Symbol(), MODE_LOTSTEP);
+
+   if(lotStep <= 0.0)
+      lotStep = 0.01;
+
+   double rawLots = FixedLotSize;
+
+   if(UseDynamicLot && StopLossPips > 0)
+     {
+      double tickValue = MarketInfo(Symbol(), MODE_TICKVALUE);
+      double tickSize  = MarketInfo(Symbol(), MODE_TICKSIZE);
+
+      if(tickValue > 0.0 && tickSize > 0.0)
+        {
+         double pipValuePerLot = tickValue * (g_pipSize / tickSize);
+         double riskAmount     = AccountBalance() * (RiskPercent / 100.0);
+         rawLots               = riskAmount / (StopLossPips * pipValuePerLot);
+        }
+     }
+
+   double normalizedLots = MathFloor(rawLots / lotStep) * lotStep;
+   normalizedLots = MathMax(minLot, MathMin(maxLot, normalizedLots));
+   return(NormalizeDouble(normalizedLots, 2));
+  }
+
+//+------------------------------------------------------------------+
 //| Execute market Buy or Sell order with SL and TP                  |
 //+------------------------------------------------------------------+
 void OpenTrade(int orderType)
   {
    RefreshRates();
 
+   double lots  = CalculateLotSize();
    double price = (orderType == OP_BUY) ? Ask : Bid;
    double sl    = 0.0;
    double tp    = 0.0;
@@ -154,11 +195,11 @@ void OpenTrade(int orderType)
    string comment = (orderType == OP_BUY) ? "24h_EMA_Buy" : "24h_EMA_Sell";
    color  arrow   = (orderType == OP_BUY) ? clrDodgerBlue : clrTomato;
 
-   int ticket = OrderSend(Symbol(), orderType, FixedLotSize, price, g_slippagePts, sl, tp, comment, MagicNumber, 0, arrow);
+   int ticket = OrderSend(Symbol(), orderType, lots, price, g_slippagePts, sl, tp, comment, MagicNumber, 0, arrow);
    if(ticket < 0)
-      Print("OrderSend failed | Type=", orderType, " | Error=", GetLastError());
+      Print("OrderSend failed | Type=", orderType, " | Lots=", DoubleToString(lots, 2), " | Error=", GetLastError());
    else
-      Print("Order opened | Ticket=", ticket, " | Type=", comment, " | Price=", DoubleToString(price, Digits));
+      Print("Order opened | Ticket=", ticket, " | Type=", comment, " | Lots=", DoubleToString(lots, 2), " | Price=", DoubleToString(price, Digits));
   }
 
 //+------------------------------------------------------------------+
