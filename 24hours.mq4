@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, FathiaOmar"
 #property link      "https://github.com/fathiaomar/bot"
-#property version   "2.30"
+#property version   "2.40"
 #property strict
 
 //--- Input Parameters
@@ -18,6 +18,7 @@ input int      TakeProfitPips       = 60;        // Take Profit (pips)
 input int      MaxSpreadPips        = 3;         // Max Allowed Spread (pips)
 input int      MaxOpenOrders        = 1;         // Max Concurrent Orders (per symbol)
 input int      SlippagePips         = 3;         // Max Slippage (pips)
+input bool     ShowChartHUD         = true;      // Display Live Status Telemetry on Chart
 
 //--- Session & Daily Risk Circuit Breaker
 input bool     UseSessionFilter     = false;     // Restrict New Entries to Broker Server Hours
@@ -109,6 +110,7 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
   {
+   Comment("");
    Print("24hours EA stopped. Reason code: ", reason);
   }
 
@@ -121,6 +123,7 @@ void OnTick()
    CheckDailyLossCircuitBreaker();
    CheckProfitTarget();
    ManageOpenPositions();
+   UpdateChartHUD();
 
    // Evaluate entry signals once per newly closed candle
    datetime currentBarTime = iTime(Symbol(), PERIOD_CURRENT, 0);
@@ -154,6 +157,45 @@ void OnTick()
       OpenTrade(OP_BUY);
    else if(bearishCross)
       OpenTrade(OP_SELL);
+  }
+
+//+------------------------------------------------------------------+
+//| Render live EA status and risk telemetry on the chart            |
+//+------------------------------------------------------------------+
+void UpdateChartHUD()
+  {
+   if(!ShowChartHUD)
+     {
+      Comment("");
+      return;
+     }
+
+   RefreshRates();
+   double spreadPips = (g_pipSize > 0.0) ? ((Ask - Bid) / g_pipSize) : 0.0;
+   double fastEMA    = iMA(Symbol(), PERIOD_CURRENT, FastEMAPeriod, 0, MODE_EMA, PRICE_CLOSE, 1);
+   double slowEMA    = iMA(Symbol(), PERIOD_CURRENT, SlowEMAPeriod, 0, MODE_EMA, PRICE_CLOSE, 1);
+   double rsiVal     = iRSI(Symbol(), PERIOD_CURRENT, RSIPeriod, PRICE_CLOSE, 1);
+   double dailyDDPct = (g_dayStartBalance > 0.0) ? (((g_dayStartBalance - AccountEquity()) / g_dayStartBalance) * 100.0) : 0.0;
+
+   string status = "ACTIVE";
+   if(!IsTradeAllowed())
+      status = "PAUSED (AUTO-TRADING OFF)";
+   else if(g_dailyHalted)
+      status = "HALTED (DAILY LOSS LIMIT)";
+   else if(!IsWithinTradingSession())
+      status = "STANDBY (OUTSIDE SESSION)";
+
+   string hud = "";
+   hud += "=== 24HOURS EA v2.40 ===\n";
+   hud += "Symbol / TF : " + Symbol() + " (M" + IntegerToString(Period()) + ") | Magic: " + IntegerToString(MagicNumber) + "\n";
+   hud += "Status      : " + status + "\n";
+   hud += "Spread      : " + DoubleToString(spreadPips, 1) + " / " + IntegerToString(MaxSpreadPips) + " pips max\n";
+   hud += "EMA(" + IntegerToString(FastEMAPeriod) + "/" + IntegerToString(SlowEMAPeriod) + ") : " + DoubleToString(fastEMA, Digits) + " / " + DoubleToString(slowEMA, Digits) + "\n";
+   hud += "RSI(" + IntegerToString(RSIPeriod) + ")     : " + DoubleToString(rsiVal, 2) + "\n";
+   hud += "Open Trades : " + IntegerToString(CountOpenOrders()) + " / " + IntegerToString(MaxOpenOrders) + "\n";
+   hud += "Floating P&L: $" + DoubleToString(AccountProfit(), 2) + " | Daily DD: " + DoubleToString(dailyDDPct, 2) + "% / " + DoubleToString(MaxDailyLossPercent, 1) + "%\n";
+
+   Comment(hud);
   }
 
 //+------------------------------------------------------------------+
