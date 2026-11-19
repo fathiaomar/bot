@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, FathiaOmar"
 #property link      "https://github.com/fathiaomar/bot"
-#property version   "2.20"
+#property version   "2.30"
 #property strict
 
 //--- Input Parameters
@@ -18,6 +18,13 @@ input int      TakeProfitPips       = 60;        // Take Profit (pips)
 input int      MaxSpreadPips        = 3;         // Max Allowed Spread (pips)
 input int      MaxOpenOrders        = 1;         // Max Concurrent Orders (per symbol)
 input int      SlippagePips         = 3;         // Max Slippage (pips)
+
+//--- Session & Daily Risk Circuit Breaker
+input bool     UseSessionFilter     = false;     // Restrict New Entries to Broker Server Hours
+input int      StartHour            = 8;         // Session Start Hour (0-23, Server Time)
+input int      EndHour              = 20;        // Session End Hour (0-23, Server Time)
+input double   MaxDailyLossPercent  = 3.0;       // Max Daily Drawdown Limit (% of Day Start Balance)
+input bool     CloseOnDailyLoss     = true;      // Close Open EA Trades When Daily Limit Hits
 
 //--- Trade Management (Break-Even & Trailing Stop)
 input bool     UseBreakEven         = true;      // Move SL to Break-Even After Profit
@@ -36,10 +43,13 @@ input double   RSISellMax           = 50.0;      // Maximum RSI for Sell Confirm
 input double   ProfitTargetUSD      = 100.0;     // Account Floating Profit Alert Target ($)
 
 //--- Internal State
-double   g_pipSize       = 0.0;
-int      g_slippagePts   = 0;
-datetime g_lastBarTime   = 0;
-bool     g_targetAlerted = false;
+double   g_pipSize         = 0.0;
+int      g_slippagePts     = 0;
+datetime g_lastBarTime     = 0;
+bool     g_targetAlerted   = false;
+int      g_currentDay      = -1;
+double   g_dayStartBalance = 0.0;
+bool     g_dailyHalted     = false;
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -55,6 +65,18 @@ int OnInit()
    if(RiskPercent <= 0.0 || RiskPercent > 10.0)
      {
       Print("Error: RiskPercent must be between 0.01 and 10.0.");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+
+   if(MaxDailyLossPercent <= 0.0 || MaxDailyLossPercent > 50.0)
+     {
+      Print("Error: MaxDailyLossPercent must be between 0.1 and 50.0.");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+
+   if(StartHour < 0 || StartHour > 23 || EndHour < 0 || EndHour > 23)
+     {
+      Print("Error: StartHour and EndHour must be between 0 and 23.");
       return(INIT_PARAMETERS_INCORRECT);
      }
 
@@ -76,6 +98,8 @@ int OnInit()
    g_slippagePts = SlippagePips * pipMultiplier;
    g_lastBarTime = iTime(Symbol(), PERIOD_CURRENT, 0);
 
+   ResetDailyTrackingIfNeeded();
+
    Print("24hours EA initialized on ", Symbol(), " | PipSize=", DoubleToString(g_pipSize, Digits));
    return(INIT_SUCCEEDED);
   }
@@ -93,6 +117,8 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
   {
+   ResetDailyTrackingIfNeeded();
+   CheckDailyLossCircuitBreaker();
    CheckProfitTarget();
    ManageOpenPositions();
 
@@ -101,6 +127,12 @@ void OnTick()
    if(currentBarTime == g_lastBarTime)
       return;
    g_lastBarTime = currentBarTime;
+
+   if(g_dailyHalted)
+      return;
+
+   if(!IsWithinTradingSession())
+      return;
 
    if(!IsTradingAllowedSafe())
       return;
@@ -122,6 +154,89 @@ void OnTick()
       OpenTrade(OP_BUY);
    else if(bearishCross)
       OpenTrade(OP_SELL);
+  }
+
+//+------------------------------------------------------------------+
+//| Reset daily balance baseline and halt state on new day           |
+//+------------------------------------------------------------------+
+void ResetDailyTrackingIfNeeded()
+  {
+   int today = TimeDayOfYear(TimeCurrent());
+   if(today != g_currentDay)
+     {
+      g_currentDay      = today;
+      g_dayStartBalance = AccountBalance();
+      g_dailyHalted     = false;
+      Print("New trading day started | DayStartBalance=", DoubleToString(g_dayStartBalance, 2));
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Check if daily equity drawdown breached MaxDailyLossPercent       |
+//+------------------------------------------------------------------+
+void CheckDailyLossCircuitBreaker()
+  {
+   if(g_dailyHalted || g_dayStartBalance <= 0.0)
+      return;
+
+   double maxAllowedLoss = g_dayStartBalance * (MaxDailyLossPercent / 100.0);
+   double currentLoss    = g_dayStartBalance - AccountEquity();
+
+   if(currentLoss >= maxAllowedLoss)
+     {
+      g_dailyHalted = true;
+      string msg = "24hours EA: Daily loss limit reached (" + DoubleToString(currentLoss, 2) + "). New entries halted.";
+      Print(msg);
+      Alert(msg);
+
+      if(CloseOnDailyLoss)
+         CloseEAOrders();
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Close all open positions managed by this EA on current symbol    |
+//+------------------------------------------------------------------+
+void CloseEAOrders()
+  {
+   if(!IsTradeAllowed() || IsTradeContextBusy())
+      return;
+
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+     {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+         continue;
+      if(OrderSymbol() != Symbol() || OrderMagicNumber() != MagicNumber)
+         continue;
+
+      RefreshRates();
+      int    ticket     = OrderTicket();
+      int    type       = OrderType();
+      double lots       = OrderLots();
+      double closePrice = (type == OP_BUY) ? Bid : Ask;
+
+      if(type == OP_BUY || type == OP_SELL)
+        {
+         if(!OrderClose(ticket, lots, closePrice, g_slippagePts, clrOrange))
+            Print("OrderClose failed on ticket ", ticket, " | Error=", GetLastError());
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Check whether current broker server hour is inside session window |
+//+------------------------------------------------------------------+
+bool IsWithinTradingSession()
+  {
+   if(!UseSessionFilter)
+      return(true);
+
+   int hour = TimeHour(TimeCurrent());
+   if(StartHour <= EndHour)
+      return(hour >= StartHour && hour < EndHour);
+
+   // Handles overnight session windows (e.g. 22:00 to 06:00)
+   return(hour >= StartHour || hour < EndHour);
   }
 
 //+------------------------------------------------------------------+
