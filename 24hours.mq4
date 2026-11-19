@@ -5,27 +5,35 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, FathiaOmar"
 #property link      "https://github.com/fathiaomar/bot"
-#property version   "2.10"
+#property version   "2.20"
 #property strict
 
 //--- Input Parameters
-input int      MagicNumber       = 240024;    // Unique EA Magic Number
-input bool     UseDynamicLot     = true;      // Use Risk-Based Dynamic Lot Sizing
-input double   RiskPercent       = 1.0;       // Risk Per Trade (% of Balance)
-input double   FixedLotSize      = 0.05;      // Fallback Fixed Lot Size
-input int      StopLossPips      = 30;        // Stop Loss (pips)
-input int      TakeProfitPips    = 60;        // Take Profit (pips)
-input int      MaxSpreadPips     = 3;         // Max Allowed Spread (pips)
-input int      MaxOpenOrders     = 1;         // Max Concurrent Orders (per symbol)
-input int      SlippagePips      = 3;         // Max Slippage (pips)
+input int      MagicNumber          = 240024;    // Unique EA Magic Number
+input bool     UseDynamicLot        = true;      // Use Risk-Based Dynamic Lot Sizing
+input double   RiskPercent          = 1.0;       // Risk Per Trade (% of Balance)
+input double   FixedLotSize         = 0.05;      // Fallback Fixed Lot Size
+input int      StopLossPips         = 30;        // Stop Loss (pips)
+input int      TakeProfitPips       = 60;        // Take Profit (pips)
+input int      MaxSpreadPips        = 3;         // Max Allowed Spread (pips)
+input int      MaxOpenOrders        = 1;         // Max Concurrent Orders (per symbol)
+input int      SlippagePips         = 3;         // Max Slippage (pips)
+
+//--- Trade Management (Break-Even & Trailing Stop)
+input bool     UseBreakEven         = true;      // Move SL to Break-Even After Profit
+input int      BreakEvenTriggerPips = 20;        // Profit Pips Required to Trigger BE
+input int      BreakEvenLockPips    = 2;         // Extra Pips Locked Above/Below Entry
+input bool     UseTrailingStop      = true;      // Enable Dynamic Trailing Stop
+input int      TrailingStartPips    = 25;        // Profit Pips Before Trailing Starts
+input int      TrailingStepPips     = 5;         // Minimum Trailing Step (pips)
 
 //--- Indicator Settings
-input int      FastEMAPeriod     = 9;         // Fast EMA Period
-input int      SlowEMAPeriod     = 21;        // Slow EMA Period
-input int      RSIPeriod         = 14;        // RSI Period
-input double   RSIBuyMin         = 50.0;      // Minimum RSI for Buy Confirmation
-input double   RSISellMax        = 50.0;      // Maximum RSI for Sell Confirmation
-input double   ProfitTargetUSD   = 100.0;     // Account Floating Profit Alert Target ($)
+input int      FastEMAPeriod        = 9;         // Fast EMA Period
+input int      SlowEMAPeriod        = 21;        // Slow EMA Period
+input int      RSIPeriod            = 14;        // RSI Period
+input double   RSIBuyMin            = 50.0;      // Minimum RSI for Buy Confirmation
+input double   RSISellMax           = 50.0;      // Maximum RSI for Sell Confirmation
+input double   ProfitTargetUSD      = 100.0;     // Account Floating Profit Alert Target ($)
 
 //--- Internal State
 double   g_pipSize       = 0.0;
@@ -47,6 +55,18 @@ int OnInit()
    if(RiskPercent <= 0.0 || RiskPercent > 10.0)
      {
       Print("Error: RiskPercent must be between 0.01 and 10.0.");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+
+   if(UseBreakEven && BreakEvenTriggerPips <= 0)
+     {
+      Print("Error: BreakEvenTriggerPips must be greater than 0 when UseBreakEven is enabled.");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+
+   if(UseTrailingStop && (TrailingStartPips <= 0 || TrailingStepPips <= 0))
+     {
+      Print("Error: TrailingStartPips and TrailingStepPips must be greater than 0.");
       return(INIT_PARAMETERS_INCORRECT);
      }
 
@@ -74,6 +94,7 @@ void OnDeinit(const int reason)
 void OnTick()
   {
    CheckProfitTarget();
+   ManageOpenPositions();
 
    // Evaluate entry signals once per newly closed candle
    datetime currentBarTime = iTime(Symbol(), PERIOD_CURRENT, 0);
@@ -101,6 +122,92 @@ void OnTick()
       OpenTrade(OP_BUY);
    else if(bearishCross)
       OpenTrade(OP_SELL);
+  }
+
+//+------------------------------------------------------------------+
+//| Manage break-even and trailing stops for open EA trades          |
+//+------------------------------------------------------------------+
+void ManageOpenPositions()
+  {
+   if(!UseBreakEven && !UseTrailingStop)
+      return;
+
+   if(!IsTradeAllowed() || IsTradeContextBusy())
+      return;
+
+   RefreshRates();
+   double minStopDistance = MarketInfo(Symbol(), MODE_STOPLEVEL) * Point;
+
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+     {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+         continue;
+      if(OrderSymbol() != Symbol() || OrderMagicNumber() != MagicNumber)
+         continue;
+
+      int    type       = OrderType();
+      double openPrice  = OrderOpenPrice();
+      double currentSL  = OrderStopLoss();
+      double currentTP  = OrderTakeProfit();
+      double newSL      = currentSL;
+
+      if(type == OP_BUY)
+        {
+         double profitPips = (Bid - openPrice) / g_pipSize;
+
+         if(UseBreakEven && profitPips >= BreakEvenTriggerPips)
+           {
+            double beSL = NormalizeDouble(openPrice + BreakEvenLockPips * g_pipSize, Digits);
+            if((Bid - beSL) >= minStopDistance && (currentSL == 0.0 || beSL > currentSL))
+               newSL = beSL;
+           }
+
+         if(UseTrailingStop && profitPips >= TrailingStartPips)
+           {
+            double candidateSL = NormalizeDouble(Bid - TrailingStartPips * g_pipSize, Digits);
+            double minStepPts  = TrailingStepPips * g_pipSize;
+            if((Bid - candidateSL) >= minStopDistance && (currentSL == 0.0 || (candidateSL - currentSL) >= minStepPts))
+              {
+               if(currentSL == 0.0 || candidateSL > currentSL)
+                  newSL = candidateSL;
+              }
+           }
+
+         if(newSL > currentSL && newSL > 0.0)
+           {
+            if(!OrderModify(OrderTicket(), openPrice, newSL, currentTP, 0, clrDodgerBlue))
+               Print("OrderModify failed on BUY ticket ", OrderTicket(), " | Error=", GetLastError());
+           }
+        }
+      else if(type == OP_SELL)
+        {
+         double profitPips = (openPrice - Ask) / g_pipSize;
+
+         if(UseBreakEven && profitPips >= BreakEvenTriggerPips)
+           {
+            double beSL = NormalizeDouble(openPrice - BreakEvenLockPips * g_pipSize, Digits);
+            if((beSL - Ask) >= minStopDistance && (currentSL == 0.0 || beSL < currentSL))
+               newSL = beSL;
+           }
+
+         if(UseTrailingStop && profitPips >= TrailingStartPips)
+           {
+            double candidateSL = NormalizeDouble(Ask + TrailingStartPips * g_pipSize, Digits);
+            double minStepPts  = TrailingStepPips * g_pipSize;
+            if((candidateSL - Ask) >= minStopDistance && (currentSL == 0.0 || (currentSL - candidateSL) >= minStepPts))
+              {
+               if(currentSL == 0.0 || candidateSL < currentSL)
+                  newSL = candidateSL;
+              }
+           }
+
+         if(newSL > 0.0 && (currentSL == 0.0 || newSL < currentSL))
+           {
+            if(!OrderModify(OrderTicket(), openPrice, newSL, currentTP, 0, clrTomato))
+               Print("OrderModify failed on SELL ticket ", OrderTicket(), " | Error=", GetLastError());
+           }
+        }
+     }
   }
 
 //+------------------------------------------------------------------+
